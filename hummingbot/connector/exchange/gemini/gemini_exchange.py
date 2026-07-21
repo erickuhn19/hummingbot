@@ -88,7 +88,7 @@ class GeminiExchange(ExchangePyBase):
 
     @property
     def domain(self):
-        return ""
+        return CONSTANTS.DEFAULT_DOMAIN
 
     @property
     def client_order_id_max_length(self):

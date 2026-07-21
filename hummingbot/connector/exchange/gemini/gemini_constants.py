@@ -3,6 +3,9 @@ from decimal import Decimal
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
+# Gemini has a single production domain; the empty string is the canonical default.
+DEFAULT_DOMAIN = ""
+
 # Base URLs
 REST_URL = "https://api.gemini.com"
 # Production WebSocket host. Per Gemini's docs (developer.gemini.com/websocket) the
