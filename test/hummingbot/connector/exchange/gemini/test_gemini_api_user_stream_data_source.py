@@ -25,6 +25,12 @@ class _UserStreamAckWS:
             yield MagicMock(data=self.acks.pop(0))
 
 
+class _MultiFrameUserStreamAckWS(_UserStreamAckWS):
+    async def iter_messages(self):
+        while self.acks:
+            yield MagicMock(data=self.acks.pop(0))
+
+
 class _HangingUserStreamAckWS(_UserStreamAckWS):
     async def iter_messages(self):
         await asyncio.Event().wait()
@@ -132,6 +138,41 @@ class GeminiUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(mock_ws.sent_payloads))
         self.assertTrue(self._is_logged(
             "ERROR", "Unexpected error occurred subscribing to user stream channels..."))
+
+    async def test_subscription_ack_skips_none_and_non_matching_frames(self):
+        mock_ws = _MultiFrameUserStreamAckWS([
+            None,  # frame with no parsed data -> skipped
+            {"e": "heartbeat"},  # frame without an id -> skipped
+            {"id": "user_balances", "status": 200},  # non-matching id -> skipped
+            {"id": "user_orders", "status": 200, "result": {}},
+        ])
+        payload = {
+            "id": "user_orders",
+            "method": CONSTANTS.WS_METHOD_SUBSCRIBE,
+            "params": [CONSTANTS.WS_ORDER_EVENTS_STREAM],
+        }
+
+        ack = await self.data_source._send_subscription_request_and_wait_for_ack_unbounded(mock_ws, payload)
+
+        self.assertEqual("user_orders", ack["id"])
+        self.assertEqual([], mock_ws.acks)
+
+    async def test_subscription_raises_when_stream_closes_before_ack(self):
+        mock_ws = _MultiFrameUserStreamAckWS([
+            {"id": "user_balances", "status": 200},  # non-matching id, then the stream ends
+        ])
+        payload = {
+            "id": "user_orders",
+            "method": CONSTANTS.WS_METHOD_SUBSCRIBE,
+            "params": [CONSTANTS.WS_ORDER_EVENTS_STREAM],
+        }
+
+        with self.assertRaises(IOError) as context:
+            await self.data_source._send_subscription_request_and_wait_for_ack_unbounded(mock_ws, payload)
+
+        self.assertEqual(
+            "Gemini user stream closed before subscription user_orders was acknowledged",
+            str(context.exception))
 
     async def test_subscribe_channels_raises_on_ack_timeout(self):
         mock_ws = _HangingUserStreamAckWS([])

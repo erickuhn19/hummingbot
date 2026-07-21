@@ -23,7 +23,8 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
-from hummingbot.core.event.events import BuyOrderCompletedEvent, OrderFilledEvent
+from hummingbot.core.event.event_logger import EventLogger
+from hummingbot.core.event.events import BuyOrderCompletedEvent, MarketEvent, MarketOrderFailureEvent, OrderFilledEvent
 from hummingbot.core.web_assistant.connections.data_types import WSResponse
 
 
@@ -385,6 +386,69 @@ class GeminiExchangeTests(TestCase):
         warning_mock.assert_called_once()
         self.assertIn("Ignoring unknown Gemini order status MODIFIED", warning_mock.call_args.args[0])
 
+    def test_user_stream_update_for_order_failure(self):
+        # Gemini reports order rejection ONLY over the WS user stream: "rejected"/"REJECTED"
+        # map to OrderState.FAILED in CONSTANTS.ORDER_STATE. REST order status has no failed
+        # representation (see test_update_order_status_when_failed), so this WS path is the
+        # single source of FAILED transitions.
+        self.exchange._set_current_timestamp(1640780000)
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="100234")
+        order.current_state = OrderState.OPEN
+        failure_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.OrderFailure, failure_logger)
+
+        event = self._make_fill_event(
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            status="rejected",
+            fill_z="0",
+            last_price="0",
+            trade_id="",
+        )
+
+        self._drive_user_stream([event])
+
+        self.assertEqual(OrderState.FAILED, order.current_state)
+        self.assertTrue(order.is_failure)
+        # The failed order left active tracking entirely.
+        self.assertNotIn("HBOT1", self.exchange.in_flight_orders)
+        self.assertNotIn("HBOT1", self.exchange._order_tracker.all_updatable_orders)
+        self.assertEqual(1, len(failure_logger.event_log))
+        failure_event = failure_logger.event_log[0]
+        self.assertIsInstance(failure_event, MarketOrderFailureEvent)
+        self.assertEqual("HBOT1", failure_event.order_id)
+        self.assertEqual(OrderType.LIMIT, failure_event.order_type)
+
+    def test_user_stream_listener_propagates_cancellation_from_event_processing(self):
+        # A CancelledError raised while an event is being processed must propagate and
+        # never be swallowed into the log-error-and-sleep recovery path.
+        order = self._start_tracking_limit_buy(amount="1")
+        event = self._make_fill_event(
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            status="PARTIALLY_FILLED",
+            fill_z="0.5",
+            last_price="100",
+            trade_id="trade-1",
+        )
+        self.exchange._order_tracker.process_trade_update = MagicMock(
+            side_effect=asyncio.CancelledError)
+        self.exchange._sleep = AsyncMock()
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = [event]
+        self.exchange._user_stream_tracker._user_stream = mock_queue
+
+        loop = asyncio.new_event_loop()
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                loop.run_until_complete(self.exchange._user_stream_event_listener())
+            # finalize the _iter_user_event_queue async generator cleanly
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
+
+        self.exchange._sleep.assert_not_awaited()
+
     # ------------------------------------------------------------------
     # Misc property / predicate coverage
     # ------------------------------------------------------------------
@@ -490,6 +554,27 @@ class GeminiExchangeTests(TestCase):
         self.assertEqual("BTC-USD", symbol_map["btcusd"])
         self.assertNotIn("perpx", symbol_map)
         self.assertNotIn("weird", symbol_map)
+
+    def test_initialize_trading_pair_symbols_skips_duplicate_pair(self):
+        # bidict raises on duplicate values; the second symbol deriving to the same
+        # hb pair must be skipped instead of aborting the whole map build.
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info([
+            self._details_entry("BTCUSD", "BTC", "USD"),
+            self._details_entry("BTCUSD2", "BTC", "USD"),  # same BTC-USD pair
+        ])
+        symbol_map = self._async_run(self.exchange.trading_pair_symbol_map())
+        self.assertEqual("BTC-USD", symbol_map["btcusd"])
+        self.assertNotIn("btcusd2", symbol_map)
+
+    def test_initialize_trading_pair_symbols_skips_malformed_entry(self):
+        # A spot entry without a "symbol" key raises KeyError inside the loop; it is
+        # logged at debug and skipped without poisoning the rest of the map.
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info([
+            {"product_type": "spot", "base_currency": "BTC", "quote_currency": "USD"},
+            self._details_entry("ETHUSD", "ETH", "USD"),
+        ])
+        symbol_map = self._async_run(self.exchange.trading_pair_symbol_map())
+        self.assertEqual({"ethusd"}, set(symbol_map.keys()))
 
     # ------------------------------------------------------------------
     # Order placement — websocket-first
@@ -678,6 +763,38 @@ class GeminiExchangeTests(TestCase):
                 trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
         self.exchange._api_post.assert_not_called()
 
+    def test_place_order_propagates_cancellation_from_ws_request(self):
+        # Cancellation during the WS placement must propagate untouched — never be
+        # treated as a transport failure that falls back to REST.
+        self._set_symbol_map()
+        self.exchange._trade_ws_request = AsyncMock(side_effect=asyncio.CancelledError)
+        self.exchange._api_post = AsyncMock()
+
+        with self.assertRaises(asyncio.CancelledError):
+            self._async_run(self.exchange._place_order(
+                order_id="HBOT1", trading_pair="BTC-USD", amount=Decimal("1"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("100")))
+        self.exchange._api_post.assert_not_called()
+
+    def test_place_order_and_process_update_backfills_exchange_id_after_terminal_stream_update(self):
+        # A terminal user-stream event can land while placement is in flight. The
+        # placement response must still backfill the exchange id, WITHOUT publishing
+        # an OPEN update that would resurrect the already-terminal order.
+        self._set_symbol_map()
+        self.exchange.start_tracking_order(
+            order_id="HBOT1", exchange_order_id=None, trading_pair="BTC-USD",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY,
+            price=Decimal("100"), amount=Decimal("1"))
+        order = self.exchange.in_flight_orders["HBOT1"]
+        order.current_state = OrderState.CANCELED  # terminal stream update won the race
+        self.exchange._place_order = AsyncMock(return_value=("999", 1700000000.0))
+
+        exchange_order_id = self._async_run(self.exchange._place_order_and_process_update(order))
+
+        self.assertEqual("999", exchange_order_id)
+        self.assertEqual("999", order.exchange_order_id)
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+
     def test_place_order_ws_transport_failure_falls_back_to_rest(self):
         self._set_symbol_map()
         self.exchange._trade_ws_request = AsyncMock(side_effect=GeminiWSTransportError("ws down"))
@@ -768,6 +885,38 @@ class GeminiExchangeTests(TestCase):
     def test_get_order_via_rest_by_client_id_not_found_returns_none(self):
         self.exchange._api_post = AsyncMock(side_effect=IOError("OrderNotFound: no such order"))
         self.assertIsNone(self._async_run(self.exchange._get_order_via_rest_by_client_id("HBOT1")))
+
+    def test_get_order_via_rest_by_client_id_skips_non_dict_rows(self):
+        # A defensive guard: non-dict rows in the status array are skipped, not crashed on.
+        matching = {"order_id": 123, "client_order_id": "HBOT1"}
+        self.exchange._api_post = AsyncMock(return_value=["unexpected-string-row", matching])
+        self.assertEqual(matching, self._async_run(
+            self.exchange._get_order_via_rest_by_client_id("HBOT1")))
+
+    def test_get_order_via_rest_by_client_id_propagates_cancellation(self):
+        # Covers the CancelledError re-raise in both _get_order_via_rest_by_client_id
+        # and _resolve_acked_order_exchange_id (the untracked-order REST backstop).
+        self.exchange._api_post = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with self.assertRaises(asyncio.CancelledError):
+            self._async_run(self.exchange._resolve_acked_order_exchange_id("HBOT-untracked"))
+
+    def test_build_order_match_options_string_and_malformed_rows(self):
+        match = GeminiExchange._build_order_match(
+            order_id="HBOT1", symbol="btcusd", amount=Decimal("1"),
+            trade_type=TradeType.BUY, order_type=OrderType.MARKET, price=Decimal("100"))
+        base_row = {
+            "client_order_id": "HBOT1", "symbol": "BTCUSD", "side": "BUY",
+            "type": CONSTANTS.ORDER_TYPE_LIMIT, "original_amount": "1", "price": "100",
+        }
+        # Gemini may return "options" as a bare string; it must be normalized to a list.
+        self.assertTrue(match(dict(base_row, options=CONSTANTS.ORDER_OPTION_IMMEDIATE_OR_CANCEL)))
+        # Malformed rows must yield False (no match), never raise: a row missing the
+        # immutable fields (KeyError) and one with a non-numeric amount (InvalidOperation).
+        self.assertFalse(match({"options": [CONSTANTS.ORDER_OPTION_IMMEDIATE_OR_CANCEL]}))
+        self.assertFalse(match(dict(base_row,
+                                    original_amount="not-a-number",
+                                    options=[CONSTANTS.ORDER_OPTION_IMMEDIATE_OR_CANCEL])))
 
     def test_place_order_ws_ambiguous_failure_places_via_rest_when_not_found(self):
         self._set_symbol_map()
@@ -1299,6 +1448,18 @@ class GeminiExchangeTests(TestCase):
 
         self.assertFalse(self._async_run(self.exchange._place_cancel("HBOT1", order)))
 
+    def test_place_cancel_propagates_cancellation(self):
+        # Cancellation of the cancel request itself must propagate — not be treated
+        # as a WS transport failure that falls back to REST.
+        self._set_symbol_map()
+        order = self._start_tracking_limit_buy(order_id="HBOT1", exchange_order_id="123")
+        self.exchange._trade_ws_request = AsyncMock(side_effect=asyncio.CancelledError)
+        self.exchange._api_post = AsyncMock()
+
+        with self.assertRaises(asyncio.CancelledError):
+            self._async_run(self.exchange._place_cancel("HBOT1", order))
+        self.exchange._api_post.assert_not_called()
+
     # ------------------------------------------------------------------
     # Trade websocket plumbing
     # ------------------------------------------------------------------
@@ -1377,6 +1538,80 @@ class GeminiExchangeTests(TestCase):
                 method=CONSTANTS.WS_METHOD_ORDER_PLACE, params={},
                 throttler_limit_id=CONSTANTS.NEW_ORDER_PATH_URL))
         self.assertEqual({}, self.exchange._trade_ws_pending_requests)
+
+    def test_trade_ws_request_propagates_cancellation_during_connect(self):
+        # CancelledError from the connect step must propagate — never be converted
+        # into the retriable GeminiWSTransportError.
+        self.exchange._connected_trade_ws = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with self.assertRaises(asyncio.CancelledError):
+            self._async_run(self.exchange._trade_ws_request(
+                method=CONSTANTS.WS_METHOD_ORDER_PLACE, params={},
+                throttler_limit_id=CONSTANTS.NEW_ORDER_PATH_URL))
+
+    def test_trade_ws_request_propagates_cancellation_during_send(self):
+        mock_ws = AsyncMock()
+        mock_ws.send = AsyncMock(side_effect=asyncio.CancelledError)
+        self.exchange._connected_trade_ws = AsyncMock(return_value=mock_ws)
+
+        with self.assertRaises(asyncio.CancelledError):
+            self._async_run(self.exchange._trade_ws_request(
+                method=CONSTANTS.WS_METHOD_ORDER_PLACE, params={},
+                throttler_limit_id=CONSTANTS.NEW_ORDER_PATH_URL))
+        self.assertEqual({}, self.exchange._trade_ws_pending_requests)
+
+    def test_trade_ws_request_reraises_ambiguity_set_on_pending_future(self):
+        # _reset_trade_ws fails pending futures with GeminiWSAmbiguousResponseError
+        # (a GeminiWSTransportError subclass); the request path must re-raise it
+        # as-is instead of re-wrapping it as a plain send failure.
+        mock_ws = AsyncMock()
+
+        async def fake_send(request):
+            self.exchange._trade_ws_pending_requests[request.payload["id"]].set_exception(
+                GeminiWSAmbiguousResponseError("the socket died before the ack arrived"))
+
+        mock_ws.send = AsyncMock(side_effect=fake_send)
+        self.exchange._connected_trade_ws = AsyncMock(return_value=mock_ws)
+
+        with self.assertRaises(GeminiWSAmbiguousResponseError) as context:
+            self._async_run(self.exchange._trade_ws_request(
+                method=CONSTANTS.WS_METHOD_ORDER_PLACE, params={},
+                throttler_limit_id=CONSTANTS.NEW_ORDER_PATH_URL))
+        self.assertIn("socket died", str(context.exception))
+        self.assertEqual({}, self.exchange._trade_ws_pending_requests)
+
+    def test_connected_trade_ws_propagates_cancellation_without_arming_cooldown(self):
+        # A cancelled handshake is not a connect FAILURE: it must propagate without
+        # arming the REST-fallback cooldown.
+        fake_ws = AsyncMock()
+        fake_ws.connect = AsyncMock(side_effect=asyncio.CancelledError)
+        self.exchange._web_assistants_factory.get_ws_assistant = AsyncMock(return_value=fake_ws)
+
+        with self.assertRaises(asyncio.CancelledError):
+            self._async_run(self.exchange._connected_trade_ws())
+
+        self.assertEqual(0.0, self.exchange._trade_ws_last_connect_failure)
+        self.assertIsNone(self.exchange._trade_ws)
+
+    def test_trade_ws_maintenance_loop_propagates_cancellation(self):
+        self.exchange._connected_trade_ws = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with self.assertRaises(asyncio.CancelledError):
+            self._async_run(self.exchange._trade_ws_maintenance_loop())
+
+    def test_trade_ws_maintenance_loop_ignores_transport_errors_silently(self):
+        # GeminiWSTransportError is the expected outcome while stopped or cooling
+        # down: the loop must sleep and retry WITHOUT logging a warning.
+        self.exchange._connected_trade_ws = AsyncMock(
+            side_effect=[GeminiWSTransportError("cooling down"), asyncio.CancelledError])
+        self.exchange._sleep = AsyncMock()
+
+        with patch.object(self.exchange.logger(), "warning") as warning_mock:
+            with self.assertRaises(asyncio.CancelledError):
+                self._async_run(self.exchange._trade_ws_maintenance_loop())
+
+        warning_mock.assert_not_called()
+        self.exchange._sleep.assert_awaited_once_with(CONSTANTS.WS_MAINTENANCE_INTERVAL)
 
     def test_trade_ws_listener_routes_acks_and_resets_on_exit(self):
         async def scenario():
@@ -1800,6 +2035,15 @@ class GeminiExchangeTests(TestCase):
         ]))
         self.assertEqual(0, len(rules))
 
+    def test_format_trading_rules_skips_hyphenated_currencies(self):
+        # Hyphenated currencies (dated contracts) break hummingbot's pair parsing and
+        # are skipped, mirroring the symbol-map build.
+        rules = self._async_run(self.exchange._format_trading_rules([
+            self._details_entry("GEMIBTCUSD", "GEMI-BTC", "USD"),
+            self._details_entry("BTCUSD", "BTC", "USD"),
+        ]))
+        self.assertEqual(["BTC-USD"], [rule.trading_pair for rule in rules])
+
     # ------------------------------------------------------------------
     # Order status
     # ------------------------------------------------------------------
@@ -1896,6 +2140,68 @@ class GeminiExchangeTests(TestCase):
 
         self.assertEqual(Decimal("1"), order.executed_amount_base)
         self.assertEqual(OrderState.FILLED, update.new_state)
+
+    def test_update_order_status_when_failed(self):
+        # Gemini's REST order-status payload has NO failed/rejected representation:
+        # a rejected order is reported with is_cancelled=true and no fills, exactly
+        # like a plain cancellation, so _order_state_from_status maps it to CANCELED —
+        # never FAILED. The WS user stream ("rejected"/"REJECTED" -> OrderState.FAILED)
+        # is therefore the ONLY source of FAILED transitions, covered by
+        # test_user_stream_update_for_order_failure.
+        update = self._request_status({
+            "order_id": 123,
+            "client_order_id": "HBOT1",
+            "is_live": False,
+            "is_cancelled": True,
+            "executed_amount": "0",
+            "remaining_amount": "1",
+            "original_amount": "1",
+            "timestampms": 1700000000000,
+        })
+        self.assertEqual(OrderState.CANCELED, update.new_state)
+        self.assertNotEqual(OrderState.FAILED, update.new_state)
+
+        # No combination of the REST status flags can ever map to FAILED.
+        for is_live in (False, True):
+            for is_cancelled in (False, True):
+                for executed, remaining in (("0", "1"), ("0.4", "0.6"), ("1", "0")):
+                    state = GeminiExchange._order_state_from_status({
+                        "order_id": 123,
+                        "is_live": is_live,
+                        "is_cancelled": is_cancelled,
+                        "executed_amount": executed,
+                        "remaining_amount": remaining,
+                        "original_amount": "1",
+                    })
+                    self.assertNotEqual(OrderState.FAILED, state)
+
+    def test_order_state_from_status_partial_fill_on_dead_order(self):
+        # Not live, not cancelled, partially executed (an IOC snapshot mid-teardown):
+        # the executed amount alone must classify it as PARTIALLY_FILLED.
+        state = GeminiExchange._order_state_from_status({
+            "order_id": 123,
+            "is_live": False,
+            "is_cancelled": False,
+            "executed_amount": "0.4",
+            "remaining_amount": "0.6",
+            "original_amount": "1",
+        })
+        self.assertEqual(OrderState.PARTIALLY_FILLED, state)
+
+    def test_request_order_status_waits_for_missing_exchange_order_id(self):
+        # An order that never resolved its exchange id cannot be polled; the wait
+        # times out and the framework treats it as "no id yet" (no REST call made).
+        self.exchange.start_tracking_order(
+            order_id="HBOT1", exchange_order_id=None, trading_pair="BTC-USD",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY,
+            price=Decimal("100"), amount=Decimal("1"))
+        order = self.exchange.in_flight_orders["HBOT1"]
+        self.exchange._api_post = AsyncMock()
+
+        with patch("hummingbot.core.data_type.in_flight_order.GET_EX_ORDER_ID_TIMEOUT", 0.05):
+            with self.assertRaises(asyncio.TimeoutError):
+                self._async_run(self.exchange._request_order_status(order))
+        self.exchange._api_post.assert_not_called()
 
     # ------------------------------------------------------------------
     # Trade updates
