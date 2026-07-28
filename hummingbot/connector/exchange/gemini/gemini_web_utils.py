@@ -10,11 +10,11 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-def public_rest_url(path_url: str, domain: str = "") -> str:
+def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
     return CONSTANTS.REST_URL + path_url
 
 
-def private_rest_url(path_url: str, domain: str = "") -> str:
+def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
     return CONSTANTS.REST_URL + path_url
 
 
@@ -53,7 +53,7 @@ def create_throttler() -> AsyncThrottler:
 
 async def get_current_server_time(
         throttler: Optional[AsyncThrottler] = None,
-        domain: str = "",
+        domain: str = CONSTANTS.DEFAULT_DOMAIN,
 ) -> float:
     """Fetch server time (epoch milliseconds) from the Date header of a Gemini API response.
 

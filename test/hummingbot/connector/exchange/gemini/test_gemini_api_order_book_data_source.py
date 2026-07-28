@@ -150,7 +150,7 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
     # ------------------------------------------------------------------
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
-    async def test_listen_for_subscriptions_subscribes(self, ws_connect_mock):
+    async def test_listen_for_subscriptions_subscribes_to_trades_and_order_diffs(self, ws_connect_mock):
         ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
         self.mocking_assistant.add_websocket_aiohttp_message(
             websocket_mock=ws_connect_mock.return_value,
@@ -299,7 +299,7 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1700000000.0, msg.timestamp)
         self.assertEqual(1700000000000000000, msg.content["update_id"])
 
-    async def test_listen_for_trades_raises_cancel_exception(self):
+    async def test_listen_for_trades_cancelled_when_listening(self):
         mock_queue = MagicMock()
         mock_queue.get.side_effect = asyncio.CancelledError
         self.data_source._message_queue[self.data_source._trade_messages_queue_key] = mock_queue
@@ -341,7 +341,7 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(11.0, msg.asks[0].price)
         self.assertEqual(2.0, msg.asks[0].amount)
 
-    async def test_listen_for_order_book_diffs_raises_cancel_exception(self):
+    async def test_listen_for_order_book_diffs_cancelled(self):
         mock_queue = MagicMock()
         mock_queue.get.side_effect = asyncio.CancelledError
         self.data_source._message_queue[self.data_source._diff_messages_queue_key] = mock_queue
@@ -383,7 +383,7 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([["9", "1"]], msg.content["bids"])
         self.assertEqual([["11", "2"]], msg.content["asks"])
 
-    async def test_listen_for_order_book_snapshots_raises_cancel_exception(self):
+    async def test_listen_for_order_book_snapshots_cancelled_when_fetching_snapshot(self):
         mock_queue = MagicMock()
         mock_queue.get.side_effect = asyncio.CancelledError
         self.data_source._message_queue[self.data_source._snapshot_messages_queue_key] = mock_queue
@@ -392,7 +392,7 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
             await self.data_source.listen_for_order_book_snapshots(self.local_event_loop, asyncio.Queue())
 
     @patch("hummingbot.core.data_type.order_book_tracker_data_source.OrderBookTrackerDataSource._sleep")
-    async def test_listen_for_order_book_snapshots_logs_exception_and_sleeps(self, sleep_mock):
+    async def test_listen_for_order_book_snapshots_log_exception(self, sleep_mock):
         bad_event = {"e": CONSTANTS.WS_EVENT_DEPTH_UPDATE, "u": 110}
         mock_queue = AsyncMock()
         mock_queue.get.side_effect = [bad_event]
@@ -519,6 +519,17 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         result = await self.data_source.subscribe_to_trading_pair(self.trading_pair)
         self.assertFalse(result)
 
+    async def test_subscribe_to_trading_pair_raises_cancel_exception(self):
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock(side_effect=asyncio.CancelledError)
+        self.data_source._ws_assistant = mock_ws
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.data_source.subscribe_to_trading_pair(self.trading_pair)
+
+        self.assertNotIn(self.ex_trading_pair, self.data_source._snapshot_symbols)
+        self.assertNotIn(self.ex_trading_pair, self.data_source._dynamic_snapshot_futures)
+
     async def test_unsubscribe_from_trading_pair_no_ws(self):
         self.data_source._ws_assistant = None
         result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
@@ -568,6 +579,31 @@ class GeminiAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.data_source._ws_assistant = mock_ws
         result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
         self.assertFalse(result)
+
+    async def test_unsubscribe_from_trading_pair_raises_cancel_exception(self):
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock(side_effect=asyncio.CancelledError)
+        self.data_source._ws_assistant = mock_ws
+        self.data_source.add_trading_pair(self.trading_pair)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
+
+        self.assertIn(self.trading_pair, self.data_source._trading_pairs)
+
+    async def test_unsubscribe_from_trading_pair_times_out_waiting_for_ack(self):
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock()  # request sent, but no ack ever arrives
+        self.data_source._ws_assistant = mock_ws
+        self.data_source.add_trading_pair(self.trading_pair)
+
+        with patch.object(CONSTANTS, "WS_SUBSCRIPTION_REQUEST_TIMEOUT", 0.01):
+            result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
+
+        self.assertFalse(result)
+        self.assertIn(self.trading_pair, self.data_source._trading_pairs)
+        self.assertTrue(self._is_logged(
+            "WARNING", f"Timed out unsubscribing from {self.trading_pair} channels"))
 
     def test_get_next_subscribe_id_increments(self):
         first = GeminiAPIOrderBookDataSource._get_next_subscribe_id()
